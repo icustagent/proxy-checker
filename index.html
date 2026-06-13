@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ChatGPT 代理检测器 v4.2</title>
+<title>通用代理检测器 v5.0</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f0f23;color:#e0e0e0;min-height:100vh}
@@ -29,8 +29,11 @@ textarea::placeholder{color:#555}
 .btn-ghost:hover{background:rgba(255,255,255,.1);color:#fff}
 .btn-deep{background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff}
 .btn-deep:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(245,158,11,.4)}
-#roundsSelect{padding:0 12px;border-radius:8px;background:#0d0d1a;border:1px solid rgba(255,255,255,.1);color:#e0e0e0;font-size:13px;font-weight:600;cursor:pointer;height:36px;min-height:36px;appearance:auto}
-#roundsSelect:focus{outline:none;border-color:#7c5cfc}
+#roundsSelect,#concurrentInput{padding:0 12px;border-radius:8px;background:#0d0d1a;border:1px solid rgba(255,255,255,.1);color:#e0e0e0;font-size:13px;font-weight:600;height:36px;min-height:36px}
+#roundsSelect{cursor:pointer;appearance:auto}
+#concurrentInput{width:76px}
+#roundsSelect:focus,#concurrentInput:focus{outline:none;border-color:#7c5cfc}
+.inline-config{display:inline-flex;align-items:center;gap:6px;height:36px;color:#888;font-size:12px;font-weight:600}
 .stats-row{display:flex;gap:6px;align-items:stretch;flex-wrap:nowrap}
 .stat{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:10px 16px;text-align:center;min-width:72px}
 .stat-num{font-size:1.3rem;font-weight:800;color:#fff}
@@ -54,9 +57,10 @@ textarea::placeholder{color:#555}
 .tag-ok{background:rgba(34,197,94,.12);color:#22c55e}
 .tag-unstable{background:rgba(234,179,8,.12);color:#eab308}
 .tag-fail{background:rgba(239,68,68,.12);color:#ef4444}
-.tag-lat{background:rgba(124,92,252,.12);color:#a78bfa}
-.tag-ip{background:rgba(59,130,246,.12);color:#60a5fa}
-.tag-cf{background:rgba(16,185,129,.12);color:#10b981}
+	.tag-lat{background:rgba(124,92,252,.12);color:#a78bfa}
+	.tag-ip{background:rgba(59,130,246,.12);color:#60a5fa}
+	.tag-country{background:rgba(14,165,233,.12);color:#38bdf8}
+	.tag-cf{background:rgba(16,185,129,.12);color:#10b981}
 .tag-cf-fail{background:rgba(239,68,68,.12);color:#ef4444}
 .tag-reg{background:rgba(59,130,246,.12);color:#60a5fa}
 .tag-reg-fail{background:rgba(239,68,68,.12);color:#ef4444}
@@ -122,6 +126,9 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 .modal-box h3{font-size:1.15rem;color:#fff;margin-bottom:10px;font-weight:700}
 .modal-box p{font-size:.85rem;color:#888;line-height:1.7;margin-bottom:24px}
 .modal-box .btn{min-width:140px}
+.auth-input{width:100%;padding:12px 14px;background:#0d0d1a;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#e0e0e0;font-size:14px;margin-bottom:12px}
+.auth-input:focus{outline:none;border-color:#7c5cfc}
+.auth-message{min-height:18px;margin-bottom:14px;color:#ef4444;font-size:12px}
 .detect-dropdown{position:relative;display:inline-flex}
 .detect-dropdown::after{content:'';position:absolute;top:100%;left:0;width:100%;height:4px}
 .detect-main-btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border:none;border-radius:8px 0 0 8px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;background:linear-gradient(135deg,#7c5cfc,#a855f7);color:#fff}
@@ -148,12 +155,23 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 </head>
 <body>
 
+<div class="modal-overlay" id="authOverlay" style="display:none">
+<div class="modal-box" style="max-width:380px">
+<div class="modal-icon" style="background:linear-gradient(135deg,rgba(124,92,252,.16),rgba(124,92,252,.05));border-color:rgba(124,92,252,.22)">&#128274;</div>
+<h3>登录代理检测器</h3>
+<p>请输入访问密码后继续操作。</p>
+<input class="auth-input" id="authPassword" type="password" autocomplete="current-password" placeholder="访问密码" onkeydown="if(event.key==='Enter')loginWithPassword()">
+<div class="auth-message" id="authMessage"></div>
+<button class="btn btn-primary" id="authLoginBtn" onclick="loginWithPassword()">登录</button>
+</div>
+</div>
+
 <!-- Header with stats -->
 <div class="header">
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
 <div>
-<h1>&#128269; ChatGPT 代理检测器 v4.2</h1>
-<p>多维度检测 &middot; CF绕过验证 &middot; 注册就绪检测 &middot; IP类型识别 &middot; Deep Check模式</p>
+<h1>&#128269; 通用代理检测器 v5.0</h1>
+<p>常规连通性 &middot; AI 服务专项检测 &middot; IP类型识别 &middot; 仓库同步</p>
 </div>
 <div class="stats-row">
 <div class="stat"><div class="stat-num" id="sTotal">0</div><div class="stat-label">总计</div></div>
@@ -185,7 +203,7 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <div class="card-head">
 <h2>&#128221; 代理列表 <span class="proxy-count-badge" id="proxyCountBadge">0 个代理</span></h2>
 <div style="display:flex;gap:8px;align-items:center">
-<span id="capBadge" class="cap-badge cap-no" style="display:none">&#9888; Deep Check不可用</span>
+<span id="capBadge" class="cap-badge cap-no" style="display:none" title="Deep Check 是用真实浏览器复测代理的慢速检查；当前服务器没装这套组件，所以这里只能做普通检测。">&#9888; Deep Check不可用</span>
 <span style="font-size:12px;color:#555">Ctrl+Enter 开始/停止</span>
 </div>
 </div>
@@ -210,11 +228,18 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <option value="2" selected>2轮(推荐)</option>
 <option value="3">3轮(严格)</option>
 </select>
+<label class="inline-config" title="同时检测的代理数量，越高越快，但服务器压力也越大">并发
+<input id="concurrentInput" type="number" min="1" max="200" step="1" value="30">
+</label>
 <button class="btn btn-ghost" onclick="dedup()">&#128260; 去重</button>
 <button class="btn btn-ghost" onclick="clearAll()">清空</button>
 <div class="fetch-dropdown" id="fetchDropdown">
 <button class="btn btn-ghost fetch-btn" id="fetchBtn" onclick="toggleFetchMenu()">&#128229; 拉取免费代理</button>
 <div class="fetch-menu" id="fetchMenu"></div>
+</div>
+<div class="fetch-dropdown" id="targetProfileDropdown">
+<button class="btn btn-ghost fetch-btn" id="targetProfileBtn" onclick="toggleTargetProfileMenu()">&#127919; 常规代理检测 &#9660;</button>
+<div class="fetch-menu" id="targetProfileMenu"></div>
 </div>
 <span id="statusText" style="margin-left:auto;font-size:12px;color:#666"></span>
 </div>
@@ -240,8 +265,8 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <button class="fbtn active" data-f="all">全部</button>
 <button class="fbtn" data-f="stable">稳定</button>
 <button class="fbtn" data-f="unstable">不稳定</button>
-<button class="fbtn" data-f="cf_bypass">CF绕过</button>
-<button class="fbtn" data-f="reg_ready">可注册</button>
+<button class="fbtn" id="filterServiceBtn" data-f="cf_bypass">服务可达</button>
+<button class="fbtn" id="filterApiBtn" data-f="reg_ready">出口IP</button>
 <button class="fbtn" data-f="fast">&lt;1秒</button>
 <button class="fbtn" data-f="mid">1-3秒</button>
 <button class="fbtn" data-f="slow">&gt;3秒</button>
@@ -284,7 +309,22 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 
 <!-- Tab: 我的仓库 -->
 <div class="tab-panel" id="tabRepo">
-<div style="display:flex;justify-content:flex-end;align-items:center;margin-bottom:10px;gap:6px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:6px;flex-wrap:wrap">
+<div class="filter-bar" id="repoFilters" style="margin-bottom:0">
+<button class="fbtn active" data-f="all">全部</button>
+<button class="fbtn" data-f="grade_a">等级A</button>
+<button class="fbtn" data-f="grade_b">等级B</button>
+<button class="fbtn" data-f="grade_c">等级C</button>
+<button class="fbtn" data-f="grade_d">等级D</button>
+<button class="fbtn" data-f="service">服务可达</button>
+<button class="fbtn" data-f="api">API可达</button>
+<button class="fbtn" data-f="cf">CF绕过</button>
+<button class="fbtn" data-f="reg">可注册</button>
+<button class="fbtn" data-f="dc">机房</button>
+<button class="fbtn" data-f="res">住宅</button>
+<button class="fbtn" data-f="country">有国家</button>
+</div>
+<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 <button class="btn btn-ghost" style="padding:4px 10px;font-size:11px;color:#ef4444;border-color:rgba(239,68,68,.3)" onclick="clearRepo()">&#128465; 清空仓库</button>
 <div class="fetch-dropdown" id="repoIODropdown">
 <button class="btn btn-ghost" style="padding:4px 10px;font-size:11px" onclick="toggleRepoIO()">&#128228; 导入/导出 &#9660;</button>
@@ -292,7 +332,6 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <div class="fetch-menu-item" onclick="document.getElementById('repoFileInput').click()">&#128228; 导入TXT</div>
 <div class="fetch-menu-item" onclick="exportRepo()">&#128229; 导出全部</div>
 <div class="fetch-menu-item" onclick="copyRepo()">&#128203; 复制全部</div>
-<div class="fetch-menu-item" onclick="getRepoLink()">&#128279; 获取仓库链接</div>
 </div>
 </div>
 <input type="file" id="repoFileInput" accept=".txt,.csv" style="display:none" onchange="importRepoTxt(this)">
@@ -303,7 +342,9 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <div class="fetch-menu-item" onclick="saveRepoToCloud()">&#128190; 保存到云端</div>
 </div>
 </div>
+<button class="btn btn-ghost" style="padding:4px 10px;font-size:11px;color:#60a5fa;border-color:rgba(96,165,250,.3)" onclick="getRepoLink(this)">&#128279; 获取仓库链接</button>
 <button class="btn btn-ghost" style="padding:4px 10px;font-size:11px;color:#22c55e;border-color:rgba(34,197,94,.3)" onclick="recheckRepo()">&#9654; 再次检测</button>
+</div>
 </div>
 <div class="result-list" id="repoList" style="max-height:420px"><div class="empty">仓库为空，检测完成后可将代理添加到仓库</div></div>
 </div>

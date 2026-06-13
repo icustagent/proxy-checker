@@ -1,233 +1,162 @@
 """
-ChatGPT Proxy Checker - Vercel Serverless Version
+Proxy Checker - Vercel Serverless Version
 """
 import json
 import time
 import os
-import re
+import sys
 import threading
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, request, jsonify, send_from_directory
-from curl_cffi import requests as cffi_requests
+import hashlib
+import hmac
+from flask import Flask, request, jsonify, send_from_directory, abort, make_response
 
-app = Flask(__name__, static_folder='../public', static_url_path='')
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from proxy_check import CheckConfig, ProxyCheckEngine, TARGET_PROFILE_OPTIONS
+
+app = Flask(__name__, static_folder=None)
+
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Proxy-Auth"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+
+def load_config():
+    config = {}
+    for name in ("config.json", "config.local.json"):
+        path = os.path.join(ROOT_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            config.update(loaded)
+    return config
+
+
+CONFIG = load_config()
+
+
+def get_config_value(key, env_name, default):
+    if env_name in os.environ:
+        return os.environ[env_name]
+    return CONFIG.get(key, default)
+
+
+def get_config_int(key, env_name, default):
+    try:
+        return int(get_config_value(key, env_name, default))
+    except (TypeError, ValueError):
+        return default
 
 # ============================================================
 # Configuration
 # ============================================================
 TIMEOUT = 10
 DETECT_TIMEOUT = 6
-MAX_CONCURRENT = 20
+MAX_CONCURRENT = get_config_int("max_concurrent", "MAX_CONCURRENT", 20)
+MAX_CONCURRENT_LIMIT = get_config_int("max_concurrent_limit", "MAX_CONCURRENT_LIMIT", 200)
 CHECK_ROUNDS = 2
+AUTH_PASSWORD = str(get_config_value("auth_password", "AUTH_PASSWORD", "linux.do"))
+AUTH_SESSION_DAYS = get_config_int("auth_session_days", "AUTH_SESSION_DAYS", 7)
+AUTH_COOKIE_NAME = "proxy_checker_auth"
+AUTH_SESSION_SECONDS = max(1, AUTH_SESSION_DAYS) * 86400
+AUTH_SESSION_SECRET = str(get_config_value("auth_session_secret", "AUTH_SESSION_SECRET", AUTH_PASSWORD))
 
-# Check targets
-TARGET_CHAT = "https://chat.openai.com/"
-TARGET_SIGNUP = "https://auth0.openai.com/u/signup/authorize?client_id=DRivsnm2Mu42T3KOpqdtwB3NYviHYzwD&scope=openid%20email%20profile%20offline_access%20model.request%20model.read%20organization.read%20organization.write&response_type=code&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fapi%2Fauth%2Fcallback%2Flogin-web&audience=https%3A%2F%2Fapi.openai.com%2Fv1&prompt=login&screen_hint=signup"
-TARGET_API = "https://api.openai.com/v1/models"
-TARGET_IP = "https://api.ipify.org?format=json"
+check_engine = ProxyCheckEngine(
+    CheckConfig(
+        timeout=TIMEOUT,
+        detect_timeout=DETECT_TIMEOUT,
+        check_rounds=CHECK_ROUNDS,
+    )
+)
 
-# CF challenge indicators
-CF_BODY_INDICATORS = [
-    "challenge-platform", "cf_chl_opt", "cf-chl-b", "cf-turnstile",
-    "Just a moment", "Checking your browser", "Verify you are human",
-    "Enable JavaScript and cookies", "ray ID", "challenge-running",
-    "challenges.cloudflare.com", "turnstile.js", "cf-challenge",
-    " managed-challenge", "cf_mitigated",
-]
-
-OPENAI_REAL_PAGE_INDICATORS = ["__next", "chat.openai.com", "ChatGPT", "prompt-textarea"]
-OPENAI_SIGNUP_INDICATORS = ["signup", "auth0", "Create your account", "email", "password", "Sign up"]
-
-executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
 sessions = {}
 sessions_lock = threading.Lock()
+TARGET_PROFILE_IDS = {str(item["id"]) for item in TARGET_PROFILE_OPTIONS}
 
-# ============================================================
-# Helper Functions
-# ============================================================
-def classify_error(err):
-    e = err.lower()
-    if "timeout" in e or "timed out" in e: return "连接超时"
-    if "refused" in e: return "连接被拒绝"
-    if "resolve" in e or "dns" in e: return "DNS解析失败"
-    if "socks" in e: return "SOCKS握手失败"
-    if "ssl" in e or "certificate" in e: return "SSL/TLS错误"
-    if "auth" in e or "407" in e: return "代理需要认证"
-    if "connection reset" in e: return "连接被重置"
-    return err[:100]
 
-def detect_cf_challenge(resp):
-    details = {"cf_detected": False, "cf_challenge_type": None, "cf_indicators": [], "has_real_content": False}
-    headers_lower = {k.lower(): v for k, v in resp.headers.items()}
-    for k in headers_lower:
-        if "cf-ray" in k or "cf-chl" in k:
-            details["cf_detected"] = True
-            details["cf_indicators"].append(f"header:{k}")
-    body = (resp.text or "").lower()
-    for ind in CF_BODY_INDICATORS:
-        if ind.lower() in body:
-            details["cf_detected"] = True
-            details["cf_indicators"].append(f"body:{ind}")
-    if details["cf_detected"]:
-        if "turnstile" in body: details["cf_challenge_type"] = "turnstile"
-        elif "managed-challenge" in body or "challenge-platform" in body: details["cf_challenge_type"] = "managed"
-        elif "just a moment" in body: details["cf_challenge_type"] = "js"
-        elif resp.status_code == 403: details["cf_challenge_type"] = "block"
-        else: details["cf_challenge_type"] = "unknown"
-    for ind in OPENAI_REAL_PAGE_INDICATORS:
-        if ind.lower() in body:
-            details["has_real_content"] = True
-            break
-    return details["cf_detected"], details
+def normalize_target_profile(value):
+    profile_id = str(value or "generic")
+    return profile_id if profile_id in TARGET_PROFILE_IDS else "generic"
 
-def detect_signup_access(resp):
-    body = (resp.text or "").lower()
-    if resp.status_code == 200:
-        for ind in OPENAI_SIGNUP_INDICATORS:
-            if ind.lower() in body: return True, "signup_accessible"
-        if any(x in body for x in ["challenge-platform", "just a moment"]):
-            return False, "cf_challenge_on_signup"
-        return True, "signup_200"
-    if resp.status_code in (301, 302, 303, 307, 308): return True, f"signup_redirect_{resp.status_code}"
-    if resp.status_code == 403: return False, "signup_blocked_403"
-    return False, f"signup_error_{resp.status_code}"
-
-def classify_ip_type(ip_info):
-    if not ip_info: return "unknown"
-    org = (ip_info.get("org") or "").lower()
-    for kw in ["amazon", "aws", "google", "cloudflare", "azure", "digitalocean", "linode", "vultr", "hetzner", "ovh", "oracle", "alibaba", "tencent"]:
-        if kw in org: return "datacenter"
-    return "residential"
-
-def do_check_once(proxy_str, stop_event=None, timeout=TIMEOUT):
-    if stop_event and stop_event.is_set():
-        return {"valid": False, "error": "已停止"}
-    r = {"valid": False, "latency": None, "error": None, "status_code": None, "ip": None, "ip_type": None,
-         "api_reachable": None, "cf_bypass": False, "cf_challenge": False, "cf_challenge_type": None,
-         "cf_indicators": [], "registration_ready": False, "registration_detail": None, "checks_detail": {}}
+def normalize_max_concurrent(value):
     try:
-        proxies = {"http": proxy_str, "https": proxy_str}
-        # Check chat.openai.com
-        try:
-            t0 = time.time()
-            resp = cffi_requests.get(TARGET_CHAT, proxies=proxies, timeout=timeout, impersonate="chrome", allow_redirects=True)
-            r["latency"] = round((time.time() - t0) * 1000)
-            r["status_code"] = resp.status_code
-            is_cf, cf_details = detect_cf_challenge(resp)
-            r["checks_detail"]["chat"] = {"status": resp.status_code, "cf_detected": is_cf, "cf_type": cf_details.get("cf_challenge_type"), "has_content": cf_details.get("has_real_content", False), "size": len(resp.text or "")}
-            if resp.status_code in (200, 301, 302, 303, 307, 308):
-                if is_cf and not cf_details.get("has_real_content"):
-                    r["cf_challenge"] = True; r["cf_challenge_type"] = cf_details.get("cf_challenge_type"); r["cf_indicators"] = cf_details.get("cf_indicators", []); r["valid"] = False; r["error"] = f"CF拦截({cf_details.get('cf_challenge_type', 'unknown')})"
-                elif is_cf and cf_details.get("has_real_content"):
-                    r["cf_bypass"] = True; r["cf_challenge"] = True; r["cf_challenge_type"] = "soft_challenge"; r["valid"] = True
-                else:
-                    r["cf_bypass"] = True; r["valid"] = True
-            else:
-                r["valid"] = False; r["error"] = f"HTTP {resp.status_code}"
-        except Exception as e:
-            r["error"] = classify_error(str(e)); r["valid"] = False; return r
-        if not r["valid"] and not r.get("cf_bypass"): return r
-        # Check API
-        try:
-            ar = cffi_requests.get(TARGET_API, proxies=proxies, timeout=timeout, impersonate="chrome")
-            r["api_reachable"] = ar.status_code in (200, 401)
-            r["checks_detail"]["api"] = {"status": ar.status_code, "reachable": r["api_reachable"]}
-        except: r["api_reachable"] = False; r["checks_detail"]["api"] = {"status": None, "reachable": False}
-        # Check signup
-        try:
-            sr = cffi_requests.get(TARGET_SIGNUP, proxies=proxies, timeout=timeout, impersonate="chrome", allow_redirects=True)
-            reg_ok, reg_detail = detect_signup_access(sr)
-            r["registration_ready"] = reg_ok; r["registration_detail"] = reg_detail
-            r["checks_detail"]["signup"] = {"status": sr.status_code, "accessible": reg_ok, "detail": reg_detail}
-        except Exception as e:
-            r["registration_ready"] = False; r["registration_detail"] = f"signup_error: {classify_error(str(e))}"
-        # Check IP
-        for ep in [TARGET_IP]:
-            try:
-                ir = cffi_requests.get(ep, proxies=proxies, timeout=6, impersonate="chrome")
-                if ir.status_code == 200:
-                    ip_data = ir.json(); r["ip"] = ip_data.get("ip")
-                    if r["ip"]:
-                        try:
-                            info = cffi_requests.get(f"https://ipinfo.io/{r['ip']}/json", timeout=5, impersonate="chrome")
-                            if info.status_code == 200:
-                                r["ip_type"] = classify_ip_type(info.json())
-                                r["checks_detail"]["ip_info"] = {"ip": r["ip"], "org": info.json().get("org", ""), "country": info.json().get("country", ""), "type": r["ip_type"]}
-                        except: r["ip_type"] = "unknown"
-                    break
-            except: continue
-    except Exception as e:
-        r["error"] = classify_error(str(e))
-    return r
+        concurrent = int(value)
+    except (TypeError, ValueError):
+        concurrent = MAX_CONCURRENT
+    return max(1, min(MAX_CONCURRENT_LIMIT, concurrent))
 
-def auto_detect(bare_addr, stop_event=None):
-    for prefix in ["http://", "https://", "socks5://", "socks5h://"]:
-        if stop_event and stop_event.is_set(): return None, False
-        r = do_check_once(prefix + bare_addr, stop_event, DETECT_TIMEOUT)
-        if r["valid"] or (r.get("cf_bypass") and r.get("status_code")):
-            return prefix + bare_addr, True
-    return None, False
+def is_auth_enabled():
+    return bool(AUTH_PASSWORD)
 
-def check_proxy_full(proxy_input, stop_event=None, rounds=None):
+def make_auth_token():
+    issued_at = str(int(time.time()))
+    signature = hmac.new(
+        AUTH_SESSION_SECRET.encode("utf-8"),
+        issued_at.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{issued_at}:{signature}"
+
+def verify_auth_token(token):
+    if not is_auth_enabled():
+        return True
+    try:
+        issued_at, signature = str(token or "").split(":", 1)
+        issued_at_int = int(issued_at)
+    except (TypeError, ValueError):
+        return False
+    if time.time() - issued_at_int > AUTH_SESSION_SECONDS:
+        return False
+    expected = hmac.new(
+        AUTH_SESSION_SECRET.encode("utf-8"),
+        issued_at.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)
+
+def get_bearer_token():
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return request.headers.get("X-Proxy-Auth", "").strip()
+
+def is_request_authenticated():
+    return verify_auth_token(get_bearer_token() or request.cookies.get(AUTH_COOKIE_NAME, ""))
+
+def unauthorized_response():
+    return jsonify({"error": "请先输入登录密码", "auth_required": True}), 401
+
+def run_check(session_id, proxies, rounds=None, target_profile=None, max_concurrent=None):
     if rounds is None: rounds = CHECK_ROUNDS
-    proxy_input = proxy_input.strip()
-    if not proxy_input or proxy_input.startswith("#"): return None
-    if stop_event and stop_event.is_set(): return None
-    original = proxy_input
-    has_prefix = proxy_input.startswith(("http://", "https://", "socks4://", "socks5://", "socks5h://"))
-    if not has_prefix:
-        proxy_input, found = auto_detect(proxy_input, stop_event)
-        if not found:
-            return {"proxy": original, "original": original, "valid": False, "unstable": False,
-                    "checks_passed": 0, "checks_total": rounds, "error": "所有协议均不可用",
-                    "latency": None, "status_code": None, "ip": None, "ip_type": None, "api_reachable": None,
-                    "cf_bypass": False, "cf_challenge": False, "cf_challenge_type": None, "cf_indicators": [],
-                    "registration_ready": False, "registration_detail": None, "detected_protocol": None,
-                    "timestamp": time.time(), "checks_detail": {}, "grade": "F"}
-    passed = 0; lats = []; last = None
-    for _ in range(rounds):
-        if stop_event and stop_event.is_set(): break
-        r = do_check_once(proxy_input, stop_event); last = r
-        if r["valid"]: passed += 1
-        if r.get("latency"): lats.append(r["latency"])
-    avg = round(sum(lats) / len(lats)) if lats else (last.get("latency") if last else None)
-    proto = proxy_input.split("://")[0] if "://" in proxy_input else None
-    chat_ok = passed == rounds; api_ok = last.get("api_reachable") if last else False
-    reg_ok = last.get("registration_ready") if last else False; cf_ok = last.get("cf_bypass") if last else False
-    if chat_ok and api_ok and reg_ok and cf_ok: grade = "A"
-    elif chat_ok and api_ok and cf_ok: grade = "B"
-    elif chat_ok and api_ok: grade = "C"
-    elif chat_ok: grade = "D"
-    else: grade = "F"
-    is_valid = chat_ok and api_ok; is_unstable = (chat_ok or api_ok) and not is_valid and passed > 0
-    return {"proxy": proxy_input, "original": original, "valid": is_valid, "unstable": is_unstable,
-            "grade": grade, "checks_passed": passed, "checks_total": rounds,
-            "error": last["error"] if last and not last["valid"] else None, "latency": avg,
-            "status_code": last["status_code"] if last else None, "ip": last["ip"] if last else None,
-            "ip_type": last["ip_type"] if last else None, "api_reachable": last["api_reachable"] if last else None,
-            "cf_bypass": last["cf_bypass"] if last else False, "cf_challenge": last["cf_challenge"] if last else False,
-            "cf_challenge_type": last["cf_challenge_type"] if last else None, "cf_indicators": last["cf_indicators"] if last else [],
-            "registration_ready": last["registration_ready"] if last else False,
-            "registration_detail": last["registration_detail"] if last else None,
-            "detected_protocol": proto, "timestamp": time.time(), "checks_detail": last["checks_detail"] if last else {}}
-
-def run_check(session_id, proxies, rounds=None):
-    if rounds is None: rounds = CHECK_ROUNDS
+    max_concurrent = normalize_max_concurrent(max_concurrent)
     with sessions_lock: sessions[session_id]["stop"] = threading.Event()
     stop_event = sessions[session_id]["stop"]
-    def check_one(proxy):
-        if stop_event.is_set(): return None
-        r = check_proxy_full(proxy, stop_event=stop_event, rounds=rounds)
-        if r:
+    def publish_result(result):
+        if result:
             with sessions_lock:
                 s = sessions.get(session_id)
-                if s: s["results"].append(r); s["done"] += 1
-        return r
+                if s: s["results"].append(result); s["done"] += 1
+    async def run_async():
+        await check_engine.check_many_async(
+            proxies=proxies,
+            stop_event=stop_event,
+            rounds=rounds,
+            max_concurrent=max_concurrent,
+            on_result=publish_result,
+            target_profile=target_profile,
+        )
     loop = asyncio.new_event_loop()
     try:
-        tasks = [loop.run_in_executor(executor, check_one, p) for p in proxies]
-        loop.run_until_complete(asyncio.gather(*tasks))
+        loop.run_until_complete(run_async())
     finally: loop.close()
     with sessions_lock:
         s = sessions.get(session_id)
@@ -251,25 +180,62 @@ threading.Thread(target=cleanup_sessions, daemon=True).start()
 # ============================================================
 @app.route('/')
 def index():
-    return send_from_directory('../public', 'index.html')
+    if is_auth_enabled() and not is_request_authenticated():
+        return send_from_directory(ROOT_DIR, 'login.html')
+    return send_from_directory(ROOT_DIR, 'index.html')
 
 @app.route('/<path:path>')
 def static_files(path):
-    return send_from_directory('../public', path)
+    if path == "login.html":
+        return send_from_directory(ROOT_DIR, path)
+    if path == "index.html" and is_auth_enabled() and not is_request_authenticated():
+        return send_from_directory(ROOT_DIR, 'login.html')
+    if path == "app.js" and is_auth_enabled() and not is_request_authenticated():
+        return unauthorized_response()
+    if path in ("index.html", "app.js"):
+        return send_from_directory(ROOT_DIR, path)
+    abort(404)
+
+@app.route('/api/auth/status', methods=['POST'])
+def api_auth_status():
+    return jsonify({"authenticated": is_request_authenticated(), "auth_required": is_auth_enabled()})
+
+@app.route('/api/auth/login', methods=['POST'])
+def api_auth_login():
+    data = request.get_json(force=True) or {}
+    password = str(data.get("password", ""))
+    if not hmac.compare_digest(password, AUTH_PASSWORD):
+        return jsonify({"error": "密码不正确", "auth_required": True}), 401
+    token = make_auth_token()
+    response = make_response(jsonify({"ok": True, "token": token, "expires_in": AUTH_SESSION_SECONDS, "auth_required": is_auth_enabled()}))
+    response.set_cookie(AUTH_COOKIE_NAME, token, max_age=AUTH_SESSION_SECONDS, httponly=True, samesite="Lax", path="/")
+    return response
+
+@app.route('/api/auth/logout', methods=['POST'])
+def api_auth_logout():
+    response = make_response(jsonify({"ok": True}))
+    response.set_cookie(AUTH_COOKIE_NAME, "", max_age=0, httponly=True, samesite="Lax", path="/")
+    return response
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
+    if not is_request_authenticated():
+        return unauthorized_response()
     data = request.get_json(force=True) or {}
     proxies = data.get("proxies", [])
     rounds = max(1, min(5, int(data.get("rounds", CHECK_ROUNDS))))
+    target_profile = normalize_target_profile(data.get("target_profile", "generic"))
+    max_concurrent = normalize_max_concurrent(data.get("max_concurrent", MAX_CONCURRENT))
     sid = str(time.time()) + str(id(proxies))
     with sessions_lock:
-        sessions[sid] = {"results": [], "done": 0, "finished": False, "stop": None, "total": len(proxies), "created": time.time(), "rounds": rounds}
-    threading.Thread(target=run_check, args=(sid, proxies, rounds), daemon=True).start()
-    return jsonify({"session_id": sid, "total": len(proxies), "rounds": rounds})
+        sessions[sid] = {"results": [], "done": 0, "finished": False, "stop": None, "total": len(proxies), "created": time.time(), "rounds": rounds, "target_profile": target_profile, "max_concurrent": max_concurrent}
+    threading.Thread(target=run_check, args=(sid, proxies, rounds, target_profile, max_concurrent), daemon=True).start()
+    return jsonify({"session_id": sid, "total": len(proxies), "rounds": rounds, "target_profile": target_profile, "max_concurrent": max_concurrent})
 
 @app.route('/api/status', methods=['POST'])
 def api_status():
+    if not is_request_authenticated():
+        return unauthorized_response()
     data = request.get_json(force=True) or {}
     sid = data.get("session_id", ""); since = data.get("since", 0)
     with sessions_lock:
@@ -277,6 +243,8 @@ def api_status():
         if not s: return jsonify({"error": "not found"})
         all_r = s["results"]; new_r = all_r[since:]
         return jsonify({"new": new_r, "total_done": s["done"], "total": s["total"], "finished": s["finished"],
+                        "target_profile": s.get("target_profile", "generic"),
+                        "max_concurrent": s.get("max_concurrent", MAX_CONCURRENT),
                         "valid_count": sum(1 for r in all_r if r.get("valid")),
                         "unstable_count": sum(1 for r in all_r if r.get("unstable")),
                         "invalid_count": sum(1 for r in all_r if not r.get("valid") and not r.get("unstable")),
@@ -285,6 +253,8 @@ def api_status():
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
+    if not is_request_authenticated():
+        return unauthorized_response()
     data = request.get_json(force=True) or {}
     sid = data.get("session_id", "")
     with sessions_lock:
@@ -297,12 +267,14 @@ def api_capabilities():
     try:
         from fetch_proxies import PROXY_SOURCES
         sources = [{"id": s["id"], "name": s["name"]} for s in PROXY_SOURCES]
-        return jsonify({"nodriver": False, "xvfb": False, "deep_check": False, "fetch_proxies": True, "proxy_sources": sources, "hosted": "vercel"})
+        return jsonify({"nodriver": False, "xvfb": False, "deep_check": False, "fetch_proxies": True, "target_profiles": list(TARGET_PROFILE_OPTIONS), "max_concurrent": MAX_CONCURRENT, "max_concurrent_limit": MAX_CONCURRENT_LIMIT, "auth_required": is_auth_enabled(), "authenticated": is_request_authenticated(), "proxy_sources": sources, "hosted": "vercel"})
     except ImportError:
-        return jsonify({"nodriver": False, "xvfb": False, "deep_check": False, "fetch_proxies": False, "proxy_sources": [], "hosted": "vercel"})
+        return jsonify({"nodriver": False, "xvfb": False, "deep_check": False, "fetch_proxies": False, "target_profiles": list(TARGET_PROFILE_OPTIONS), "max_concurrent": MAX_CONCURRENT, "max_concurrent_limit": MAX_CONCURRENT_LIMIT, "auth_required": is_auth_enabled(), "authenticated": is_request_authenticated(), "proxy_sources": [], "hosted": "vercel"})
 
 @app.route('/api/fetch-proxies', methods=['POST'])
 def api_fetch_proxies():
+    if not is_request_authenticated():
+        return unauthorized_response()
     try:
         from fetch_proxies import fetch_proxies
     except ImportError:

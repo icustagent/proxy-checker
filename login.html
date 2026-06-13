@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录代理检测器</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f0f23;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.login-card{width:100%;max-width:380px;background:#16162e;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;box-shadow:0 16px 48px rgba(0,0,0,.35)}
+.login-icon{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;margin:0 auto 18px;background:rgba(124,92,252,.14);border:1px solid rgba(124,92,252,.24);font-size:24px}
+h1{font-size:1.2rem;text-align:center;color:#fff;margin-bottom:8px}
+p{font-size:.86rem;color:#888;text-align:center;line-height:1.6;margin-bottom:22px}
+input{width:100%;height:44px;padding:0 13px;background:#0d0d1a;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#e0e0e0;font-size:14px;margin-bottom:12px}
+input:focus{outline:none;border-color:#7c5cfc}
+button{width:100%;height:42px;border:none;border-radius:8px;background:linear-gradient(135deg,#7c5cfc,#a855f7);color:#fff;font-size:14px;font-weight:700;cursor:pointer;transition:opacity .2s}
+button:disabled{opacity:.55;cursor:not-allowed}
+.message{min-height:18px;color:#ef4444;font-size:12px;text-align:center;margin-bottom:14px}
+</style>
+</head>
+<body>
+<main class="login-card">
+<div class="login-icon">&#128274;</div>
+<h1>登录代理检测器</h1>
+<p>请输入访问密码后继续操作。</p>
+<input id="password" type="password" autocomplete="current-password" placeholder="访问密码" autofocus>
+<div class="message" id="message"></div>
+<button id="loginBtn" type="button">登录</button>
+</main>
+<script>
+var input=document.getElementById('password');
+var message=document.getElementById('message');
+var button=document.getElementById('loginBtn');
+function setBusy(busy){
+  button.disabled=busy;
+  button.textContent=busy?'登录中...':'登录';
+}
+function login(){
+  var password=input.value;
+  if(!password){message.textContent='请输入密码';input.focus();return}
+  setBusy(true);
+  fetch('/api/auth/login',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    credentials:'same-origin',
+    body:JSON.stringify({password:password})
+  }).then(function(resp){
+    return resp.json().then(function(data){return {ok:resp.ok,data:data}});
+  }).then(function(result){
+    if(!result.ok||!result.data.ok){
+      message.textContent=result.data.error||'登录失败';
+      setBusy(false);
+      return;
+    }
+    if(result.data.token){
+      try{localStorage.setItem('proxy_checker_auth_token',result.data.token)}catch(e){}
+    }
+    location.replace('/');
+  }).catch(function(){
+    message.textContent='网络错误';
+    setBusy(false);
+  });
+}
+button.addEventListener('click',login);
+input.addEventListener('keydown',function(e){if(e.key==='Enter')login()});
+</script>
+</body>
+</html>

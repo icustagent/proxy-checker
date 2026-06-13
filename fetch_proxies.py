@@ -7,6 +7,8 @@ import re
 import subprocess
 from curl_cffi import requests as cffi_requests
 
+IP_PORT_RE = re.compile(r"(?<!\d)((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})(?!\d)")
+
 PROXY_SOURCES = [
     {
         "id": "proxifly",
@@ -33,7 +35,79 @@ PROXY_SOURCES = [
         "name": "CheckerProxy.net Archive",
         "url": "https://api.checkerproxy.net/v1/landing/archive",
     },
+    {
+        "id": "spysme_http",
+        "name": "Spys.me HTTP Proxy List",
+        "url": "https://spys.me/proxy.txt",
+    },
+    {
+        "id": "spysme_socks",
+        "name": "Spys.me SOCKS Proxy List",
+        "url": "https://spys.me/socks.txt",
+    },
+    {
+        "id": "proxyscrape_http",
+        "name": "ProxyScrape HTTP API",
+        "url": "https://api.proxyscrape.com/?request=getproxies&proxytype=http&timeout=1000&country=All",
+    },
+    {
+        "id": "proxyscrape_socks5",
+        "name": "ProxyScrape SOCKS5 API",
+        "url": "https://api.proxyscrape.com/?request=getproxies&proxytype=socks5&timeout=1000&country=All",
+    },
+    {
+        "id": "geonode",
+        "name": "GeoNode Recently Checked",
+        "url": "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc",
+    },
+    {
+        "id": "my_proxy",
+        "name": "My-Proxy Hourly HTTP List",
+        "url": "https://www.my-proxy.com/free-proxy-list.html",
+    },
 ]
+
+
+def _valid_ip(ip):
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(part) <= 255 for part in parts)
+    except ValueError:
+        return False
+
+
+def _valid_port(port):
+    try:
+        value = int(port)
+    except (TypeError, ValueError):
+        return False
+    return 1 <= value <= 65535
+
+
+def _build_proxy(ip, port, protocol="", country="", city=""):
+    proto = (protocol or "").lower()
+    address = f"{ip}:{port}"
+    proxy = f"{proto}://{address}" if proto else address
+    return {
+        "proxy": proxy,
+        "protocol": proto,
+        "ip": ip,
+        "port": int(port),
+        "country": country or "",
+        "city": city or "",
+    }
+
+
+def _append_proxy(proxies, seen, ip, port, protocol="", country="", city=""):
+    if not _valid_ip(ip) or not _valid_port(port):
+        return
+    key = f"{ip}:{port}"
+    if key in seen:
+        return
+    seen.add(key)
+    proxies.append(_build_proxy(ip, port, protocol, country, city))
 
 
 def _fetch_proxifly(url, limit):
@@ -251,10 +325,180 @@ def _fetch_checkerproxy(url, limit):
     return proxies, None
 
 
+def _fetch_spysme(url, limit, protocol):
+    """Fetch from spys.me text lists with update metadata in the header."""
+    resp = cffi_requests.get(url, timeout=20, impersonate="chrome")
+    resp.raise_for_status()
+    text = resp.text
+
+    proxies = []
+    seen = set()
+    for line in text.splitlines():
+        match = re.match(
+            r"^\s*(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\s+([A-Z]{2})-",
+            line,
+        )
+        if not match:
+            continue
+        ip, port, country = match.groups()
+        _append_proxy(proxies, seen, ip, port, protocol, country)
+        if len(proxies) >= limit:
+            break
+    if not proxies:
+        return [], "未找到代理数据"
+    return proxies, None
+
+
+def _fetch_plain_ip_port(url, limit, protocol):
+    """Fetch plain text proxy lists in ip:port format."""
+    resp = cffi_requests.get(url, timeout=20, impersonate="chrome")
+    resp.raise_for_status()
+    text = resp.text
+
+    proxies = []
+    seen = set()
+    for ip, port in IP_PORT_RE.findall(text):
+        _append_proxy(proxies, seen, ip, port, protocol)
+        if len(proxies) >= limit:
+            break
+    if not proxies:
+        return [], "未找到代理数据"
+    return proxies, None
+
+
+def _fetch_geonode(url, limit):
+    """Fetch recently checked proxies from GeoNode API."""
+    resp = cffi_requests.get(url, timeout=20, impersonate="chrome")
+    resp.raise_for_status()
+    data = resp.json()
+    rows = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return [], "数据格式错误"
+
+    proxies = []
+    seen = set()
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        ip = str(item.get("ip") or "").strip()
+        port = str(item.get("port") or "").strip()
+        protocols = item.get("protocols")
+        protocol = ""
+        if isinstance(protocols, list) and protocols:
+            protocol = str(protocols[0] or "").lower()
+        if protocol not in {"http", "https", "socks4", "socks5"}:
+            protocol = ""
+        _append_proxy(
+            proxies,
+            seen,
+            ip,
+            port,
+            protocol,
+            str(item.get("country") or ""),
+            str(item.get("city") or ""),
+        )
+        if len(proxies) >= limit:
+            break
+    if not proxies:
+        return [], "未找到代理数据"
+    return proxies, None
+
+
+def _fetch_my_proxy(url, limit):
+    """Fetch My-Proxy hourly HTTP list, parsing ip:port#CC entries."""
+    resp = cffi_requests.get(url, timeout=20, impersonate="chrome")
+    resp.raise_for_status()
+    html = resp.text
+
+    proxies = []
+    seen = set()
+    for ip, port, country in re.findall(
+        r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})#([A-Z]{2})",
+        html,
+    ):
+        _append_proxy(proxies, seen, ip, port, "http", country)
+        if len(proxies) >= limit:
+            break
+    if not proxies:
+        return [], "未找到代理数据"
+    return proxies, None
+
+
+def _fetch_source(source, limit):
+    source_id = source["id"]
+    if source_id == "proxifly":
+        return _fetch_proxifly(source["url"], limit)
+    if source_id == "proxynova":
+        return _fetch_proxynova(source["url"], limit)
+    if source_id == "hidemn":
+        return _fetch_hidemn(source["url"], limit)
+    if source_id == "freeproxy":
+        return _fetch_freeproxy(source["url"], limit)
+    if source_id == "checkerproxy":
+        return _fetch_checkerproxy(source["url"], limit)
+    if source_id == "spysme_http":
+        return _fetch_spysme(source["url"], limit, "http")
+    if source_id == "spysme_socks":
+        return _fetch_spysme(source["url"], limit, "")
+    if source_id == "proxyscrape_http":
+        return _fetch_plain_ip_port(source["url"], limit, "http")
+    if source_id == "proxyscrape_socks5":
+        return _fetch_plain_ip_port(source["url"], limit, "socks5")
+    if source_id == "geonode":
+        return _fetch_geonode(source["url"], limit)
+    if source_id == "my_proxy":
+        return _fetch_my_proxy(source["url"], limit)
+    return [], f"未适配的来源: {source_id}"
+
+
+def _proxy_key(proxy):
+    ip = str(proxy.get("ip") or "").strip().lower()
+    port = str(proxy.get("port") or "").strip()
+    if ip and port:
+        return f"{ip}:{port}"
+    raw = str(proxy.get("proxy") or "").strip().lower()
+    return re.sub(r"^[a-z0-9+.-]+://", "", raw)
+
+
+def _fetch_all_sources(limit):
+    proxies = []
+    seen = set()
+    errors = []
+    source_limit = max(1, int(limit))
+    for source in PROXY_SOURCES:
+        try:
+            source_proxies, err = _fetch_source(source, source_limit)
+        except Exception as e:
+            errors.append(f"{source['id']}: {str(e)[:120]}")
+            continue
+        if err:
+            errors.append(f"{source['id']}: {err}")
+            continue
+        for proxy in source_proxies:
+            key = _proxy_key(proxy)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            proxies.append(proxy)
+    if proxies:
+        return proxies[:limit], None
+    return [], "所有来源拉取失败: " + "; ".join(errors[:5])
+
+
 def fetch_proxies(source_id, limit=999999):
     """
     Fetch proxies from a source. Returns (proxy_list, source_name, error).
     """
+    limit = max(1, int(limit))
+    if source_id == "all":
+        try:
+            proxies, err = _fetch_all_sources(limit)
+            if err:
+                return [], "全部免费代理源", err
+            return proxies, "全部免费代理源", None
+        except Exception as e:
+            return [], "全部免费代理源", f"请求失败: {str(e)[:200]}"
+
     source = None
     for s in PROXY_SOURCES:
         if s["id"] == source_id:
@@ -264,18 +508,7 @@ def fetch_proxies(source_id, limit=999999):
         return [], None, f"未知来源: {source_id}"
 
     try:
-        if source_id == "proxifly":
-            proxies, err = _fetch_proxifly(source["url"], limit)
-        elif source_id == "proxynova":
-            proxies, err = _fetch_proxynova(source["url"], limit)
-        elif source_id == "hidemn":
-            proxies, err = _fetch_hidemn(source["url"], limit)
-        elif source_id == "freeproxy":
-            proxies, err = _fetch_freeproxy(source["url"], limit)
-        elif source_id == "checkerproxy":
-            proxies, err = _fetch_checkerproxy(source["url"], limit)
-        else:
-            return [], source["name"], f"未适配的来源: {source_id}"
+        proxies, err = _fetch_source(source, limit)
 
         if err:
             return [], source["name"], err
