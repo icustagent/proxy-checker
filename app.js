@@ -788,19 +788,60 @@ function addToRepoByGrade(grade){
 var REPO_KEY='proxy_checker_repo';
 var USER_TOKEN_KEY='proxy_checker_token';
 var REPO_SYNCED_KEY='proxy_checker_synced';
+var repoCache=null;
+var userTokenCache=null;
+
+function compactRepoItem(p){
+  var item={proxy:String(p.proxy||'')};
+  if(!item.proxy)return null;
+  item.grade=p.grade||'?';
+  if(p.latency!==undefined&&p.latency!==null)item.latency=p.latency;
+  if(p.ip)item.ip=p.ip;
+  if(p.country)item.country=String(p.country).toUpperCase();
+  if(p.ip_type)item.ip_type=p.ip_type;
+  if(p.service_reachable===true)item.service_reachable=true;
+  if(p.api_reachable===true)item.api_reachable=true;
+  if(p.cf_bypass)item.cf_bypass=true;
+  if(p.registration_ready)item.registration_ready=true;
+  if(p.target_profile)item.target_profile=p.target_profile;
+  if(p.target_name)item.target_name=p.target_name;
+  item.added=p.added||Date.now();
+  item.updated=p.updated||item.added;
+  return item;
+}
+
+function compactRepo(repo){
+  var out=[];
+  var seen={};
+  (repo||[]).forEach(function(p){
+    var item=compactRepoItem(p||{});
+    if(!item||seen[item.proxy])return;
+    seen[item.proxy]=true;
+    out.push(item);
+  });
+  return out;
+}
 
 function getUserToken(){
-  var t=localStorage.getItem(USER_TOKEN_KEY);
-  if(!t){t='user_'+Math.random().toString(36).substr(2,12);localStorage.setItem(USER_TOKEN_KEY,t)}
+  if(userTokenCache)return userTokenCache;
+  var t='';
+  try{t=localStorage.getItem(USER_TOKEN_KEY)||''}catch(e){}
+  if(!t){
+    t='user_'+Math.random().toString(36).substr(2,12);
+    try{localStorage.setItem(USER_TOKEN_KEY,t)}catch(e){}
+  }
+  userTokenCache=t;
   return t;
 }
 
-function syncRepoToServer(){
+function syncRepoToServer(repoOverride){
   if(!requireAuthenticatedUI())return;
-  var repo=loadRepo();
+  var repo=compactRepo(repoOverride||loadRepo());
   var token=getUserToken();
   post('/api/repo/save',{repo:repo,token:token},function(err,res){
-    if(!err&&res.ok){localStorage.setItem(REPO_SYNCED_KEY,JSON.stringify({count:res.count,time:Date.now()}))}
+    if(!err&&res.ok){
+      try{localStorage.setItem(REPO_SYNCED_KEY,JSON.stringify({count:res.count,time:Date.now()}))}catch(e){}
+    }
   });
 }
 
@@ -984,12 +1025,41 @@ function restoreActiveSession(){
 }
 
 function loadRepo(){
-  try{return JSON.parse(localStorage.getItem(REPO_KEY))||[]}catch(e){return[]}
+  if(repoCache)return repoCache;
+  try{
+    repoCache=compactRepo(JSON.parse(localStorage.getItem(REPO_KEY))||[]);
+    return repoCache;
+  }catch(e){
+    repoCache=[];
+    return repoCache;
+  }
 }
-function saveRepo(repo){
-  localStorage.setItem(REPO_KEY,JSON.stringify(repo));
-  clearTimeout(saveRepo._timer);
-  saveRepo._timer=setTimeout(syncRepoToServer,1000);
+function saveRepo(repo,options){
+  options=options||{};
+  repoCache=compactRepo(repo);
+  var json=JSON.stringify(repoCache);
+  var localSaved=false;
+  try{
+    localStorage.setItem(REPO_KEY,json);
+    localSaved=true;
+  }catch(e){
+    try{
+      localStorage.removeItem(RESULTS_KEY);
+      localStorage.setItem(REPO_KEY,json);
+      localSaved=true;
+    }catch(e2){
+      try{localStorage.removeItem(REPO_KEY)}catch(e3){}
+      if(!saveRepo._quotaWarned){
+        toast('仓库太大，本地缓存已跳过，仍会同步到云端');
+        saveRepo._quotaWarned=true;
+      }
+    }
+  }
+  if(options.sync!==false){
+    clearTimeout(saveRepo._timer);
+    saveRepo._timer=setTimeout(function(){syncRepoToServer(repoCache)},1000);
+  }
+  return localSaved;
 }
 
 function resultToRepoItem(r){
@@ -1013,7 +1083,7 @@ function resultToRepoItem(r){
 
 function addRepoItems(items){
   if(!items.length)return {added:0,updated:0};
-  localStorage.removeItem('repo_manually_cleared');
+  try{localStorage.removeItem('repo_manually_cleared')}catch(e){}
   var repo=loadRepo();
   var indexByProxy={};
   repo.forEach(function(p,i){indexByProxy[p.proxy]=i});
@@ -1133,7 +1203,7 @@ function restoreRepoFromCloud(){
   if(!requireAuthenticatedUI())return;
   var local=loadRepo();
   if(local.length>0 && !confirm('清空本地仓库并从云端恢复？'))return;
-  localStorage.removeItem('repo_manually_cleared');
+  try{localStorage.removeItem('repo_manually_cleared')}catch(e){}
   loadRepoFromServer(function(count){
     if(count>0) toast('已从云端恢复 '+count+' 个代理');
     else toast('云端没有仓库数据');
@@ -1153,14 +1223,14 @@ document.addEventListener('click',function(e){
 function saveRepoToCloud(){
   if(!requireAuthenticatedUI())return;
   document.getElementById('repoCloudDropdown').classList.remove('open');
-  localStorage.removeItem('repo_manually_cleared');
+  try{localStorage.removeItem('repo_manually_cleared')}catch(e){}
   var repo=loadRepo();
   if(!repo.length){toast('仓库为空，无需保存');return}
   var token=getUserToken();
   post('/api/repo/save',{repo:repo,token:token},function(err,res){
     if(err){toast('保存失败: '+err);return}
     if(res.ok){
-      localStorage.setItem(REPO_SYNCED_KEY,JSON.stringify({count:res.count,time:Date.now()}));
+      try{localStorage.setItem(REPO_SYNCED_KEY,JSON.stringify({count:res.count,time:Date.now()}))}catch(e){}
       toast('已保存 '+res.count+' 个代理到云端');
     }
   });
@@ -1169,14 +1239,15 @@ function saveRepoToCloud(){
 function clearRepo(){
   if(!loadRepo().length){toast('仓库已经是空的');return}
   if(!confirm('确定清空本地仓库？\n注意：云端数据不会被删除，可随时通过「恢复云端数据」恢复。'))return;
-  localStorage.removeItem(REPO_KEY);
-  localStorage.setItem('repo_manually_cleared','1');
+  repoCache=[];
+  try{localStorage.removeItem(REPO_KEY)}catch(e){}
+  try{localStorage.setItem('repo_manually_cleared','1')}catch(e){}
   renderRepo();
   toast('本地仓库已清空（云端数据保留）');
 }
 
 function importRepoTxt(input){
-  localStorage.removeItem('repo_manually_cleared');
+  try{localStorage.removeItem('repo_manually_cleared')}catch(e){}
   var file=input.files[0];
   if(!file)return;
   var reader=new FileReader();
