@@ -688,7 +688,6 @@ def public_settings_payload():
         "run_log_limit": RUN_LOG_LIMIT,
         "timezone": APP_TIMEZONE,
         "port": PORT,
-        "log_file": LOG_FILE_PATH,
         "timezone_options": list(TIMEZONE_OPTIONS),
         "password_configurable": "AUTH_PASSWORD" not in os.environ,
     }

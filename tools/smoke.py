@@ -119,6 +119,8 @@ def main() -> None:
         raise AssertionError(f"capabilities missing auto_mode: {capabilities}")
     if "auto_mode_hint" not in capabilities:
         raise AssertionError(f"capabilities missing auto_mode_hint: {capabilities}")
+    if "log_file" in (capabilities.get("settings") or {}):
+        raise AssertionError(f"capabilities should not expose log_file: {capabilities}")
     profile_ids = {item["id"] for item in capabilities.get("target_profiles", [])}
     if profile_ids != EXPECTED_PROFILES:
         raise AssertionError(f"unexpected target profiles: {profile_ids}")
@@ -170,6 +172,8 @@ def main() -> None:
     for key in ("check_rounds", "max_check_rounds", "max_concurrent", "max_concurrent_limit", "timezone", "timezone_options"):
         if key not in settings_data:
             raise AssertionError(f"settings missing {key}: {settings}")
+    if "log_file" in settings_data:
+        raise AssertionError(f"settings should not expose log_file: {settings_data}")
     if int(settings_data.get("max_check_rounds", 0)) != 3:
         raise AssertionError(f"max_check_rounds should be 3: {settings_data}")
 

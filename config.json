@@ -1,8 +1,14 @@
 {
   "auth_password": "linux.do",
   "auth_session_days": 7,
+  "check_rounds": 2,
+  "max_check_rounds": 3,
   "max_concurrent": 30,
   "max_concurrent_limit": 200,
+  "timeout": 12,
+  "detect_timeout": 8,
+  "run_log_limit": 100,
+  "timezone": "UTC",
   "port": 8888,
   "log_file": "server.log"
 }
