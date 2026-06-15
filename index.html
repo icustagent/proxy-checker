@@ -42,11 +42,11 @@ textarea::placeholder{color:#555}
 .fbtn{padding:4px 10px;border:1px solid rgba(255,255,255,.1);border-radius:20px;background:transparent;color:#888;font-size:11px;cursor:pointer;transition:all .2s}
 .fbtn.active{border-color:#7c5cfc;color:#7c5cfc;background:rgba(124,92,252,.1)}
 .fbtn:hover{border-color:#7c5cfc;color:#aaa}
-.result-list{max-height:420px;overflow-y:auto}
+.result-list{max-height:420px;overflow-y:auto;contain:content}
 .result-list::-webkit-scrollbar{width:6px}
 .result-list::-webkit-scrollbar-track{background:transparent}
 .result-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:3px}
-.proxy-item{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:rgba(255,255,255,.02);border-radius:8px;margin-bottom:6px;border:1px solid rgba(255,255,255,.04);transition:background .2s}
+.proxy-item{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:rgba(255,255,255,.02);border-radius:8px;margin-bottom:6px;border:1px solid rgba(255,255,255,.04);transition:background .2s;content-visibility:auto;contain-intrinsic-size:76px}
 .proxy-item:hover{background:rgba(255,255,255,.05)}
 .proxy-item.valid{border-left:3px solid #22c55e}
 .proxy-item.unstable{border-left:3px solid #eab308}
@@ -71,6 +71,8 @@ textarea::placeholder{color:#555}
 .speed-mid{background:#eab308}
 .speed-slow{background:#ef4444}
 .empty{text-align:center;padding:40px;color:#444;font-size:13px}
+.list-more{display:flex;align-items:center;justify-content:center;gap:10px;padding:12px;color:#777;font-size:12px}
+.list-more .btn{padding:5px 12px;font-size:11px}
 .copy-btn{padding:4px 10px;border:none;border-radius:5px;background:rgba(124,92,252,.2);color:#a78bfa;font-size:11px;cursor:pointer;opacity:1;transition:background .2s}
 .copy-btn:hover{background:rgba(124,92,252,.4)}
 .toast{position:fixed;bottom:30px;left:50%;transform:translateX(-50%) translateY(80px);background:#222;color:#fff;padding:10px 24px;border-radius:8px;font-size:13px;opacity:0;transition:all .3s;z-index:1300;pointer-events:none}
@@ -322,7 +324,7 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <div class="filter-bar" id="fFilters" style="margin-bottom:0">
 <button class="fbtn active" data-f="all">全部</button>
 <button class="fbtn" data-f="timeout">超时</button>
-<button class="fbtn" data-f="cf_block">CF拦截</button>
+<button class="fbtn" data-f="cf_block">网页CF拦截</button>
 <button class="fbtn" data-f="conn">连接错误</button>
 <button class="fbtn" data-f="other">其他</button>
 </div>
@@ -345,7 +347,7 @@ textarea::-webkit-scrollbar-thumb:hover{background:rgba(124,92,252,.5)}
 <button class="fbtn" data-f="grade_d">等级D</button>
 <button class="fbtn" data-f="service">服务可达</button>
 <button class="fbtn" data-f="api">API域名可达</button>
-<button class="fbtn" data-f="cf">CF绕过</button>
+<button class="fbtn" data-f="cf">网页CF未拦截</button>
 <button class="fbtn" data-f="dc">机房</button>
 <button class="fbtn" data-f="res">住宅</button>
 <button class="fbtn" data-f="country">有国家</button>

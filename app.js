@@ -32,6 +32,9 @@ var autoSessionId='';
 var autoRunResultKeys={};
 var autoStopRequestedSession='';
 var autoStopRepoPromptSession='';
+var RESULT_RENDER_BATCH=400;
+var resultRenderLimits={valid:RESULT_RENDER_BATCH,invalid:RESULT_RENDER_BATCH,repo:RESULT_RENDER_BATCH};
+var resultsSaveTimer=null;
 var appSettings={
   check_rounds:2,
   max_check_rounds:3,
@@ -272,7 +275,7 @@ function updateTargetProfileUI(){
   if(btn)btn.innerHTML='&#127919; '+esc(profile.name)+' &#9660;';
   var serviceBtn=document.getElementById('filterServiceBtn');
   var apiBtn=document.getElementById('filterApiBtn');
-  if(serviceBtn)serviceBtn.textContent=profile.has_cf_detection?'CF绕过':'服务可达';
+  if(serviceBtn)serviceBtn.textContent=profile.has_cf_detection?'网页CF未拦截':'服务可达';
   if(apiBtn)apiBtn.textContent=profile.has_api?'API域名可达':'出口IP';
   updateStatLabels();
 }
@@ -369,13 +372,14 @@ function renderRoundsSelect(maxRounds,selected){
 function applyAppSettings(settings){
   if(!settings)return;
   appSettings=Object.assign({},appSettings,settings);
-  var savedRounds=localStorage.getItem(ROUNDS_KEY);
-  var rounds=normalizeRounds(savedRounds||appSettings.check_rounds);
+  var rounds=normalizeRounds(appSettings.check_rounds);
   renderRoundsSelect(appSettings.max_check_rounds,rounds);
+  localStorage.setItem(ROUNDS_KEY,String(rounds));
   if(concurrentInput){
-    var savedConcurrent=localStorage.getItem(CONCURRENT_KEY);
     concurrentInput.max=String(appSettings.max_concurrent_limit||200);
-    concurrentInput.value=String(normalizeConcurrent(savedConcurrent||appSettings.max_concurrent));
+    var concurrent=normalizeConcurrent(appSettings.max_concurrent);
+    concurrentInput.value=String(concurrent);
+    localStorage.setItem(CONCURRENT_KEY,String(concurrent));
   }
   updateStatLabels();
 }
@@ -408,7 +412,7 @@ function updateStatLabels(){
   document.querySelector('#sValid').closest('.stat').querySelector('.stat-label').textContent='稳定('+r+'/'+r+')';
   document.querySelector('#sUnstable').closest('.stat').querySelector('.stat-label').textContent='不稳定('+(r-1>0?r-1:1)+'/'+r+')';
   var profile=getTargetProfileInfo(currentTargetProfile);
-  document.querySelector('#sCfBypass').closest('.stat').querySelector('.stat-label').textContent=profile.has_cf_detection?'CF绕过':'服务可达';
+  document.querySelector('#sCfBypass').closest('.stat').querySelector('.stat-label').textContent=profile.has_cf_detection?'网页CF未拦截':'服务可达';
   document.querySelector('#sApiReachable').closest('.stat').querySelector('.stat-label').textContent=profile.has_api?'API域名':'出口IP';
 }
 roundsSelect.addEventListener('change',updateStatLabels);
@@ -452,6 +456,7 @@ function startCheck(options){
   }
 
   clearActiveSession();
+  resetResultRenderLimits('results');
   busy=true; V=[]; U=[]; F=[]; totalCount=toCheck.length; resultsIndex=0;
   saveResults();
   checkBtn.disabled=true;
@@ -521,14 +526,13 @@ function poll(){
     }
     if(res.new&&res.new.length>0){
       res.new.forEach(function(r){
-        if(r.valid){V.push(r);appendItem(validList,r,"valid")}
-        else if(r.unstable){U.push(r);appendItem(validList,r,"unstable")}
-        else{F.push(r);appendItem(failList,r,"invalid")}
+        upsertResult(r);
       });
       resultsIndex+=res.new.length;
       var pct=Math.round(res.total_done/totalCount*100);
       progBar.style.width=pct+"%";
       statusText.textContent="已检测 "+res.total_done+"/"+totalCount+" ("+pct+"%)";
+      renderResultLists();
       updateStats();
       saveResults();
       saveActiveSession();
@@ -558,7 +562,7 @@ function finishCheck(stopped){
   document.getElementById('stopBtn').style.display="none";
   prog.style.display="none";
   statusText.textContent=stopped?"已停止":"检测完成";
-  saveResults();
+  saveResultsNow();
   updateSkipBadge();
 }
 
@@ -590,22 +594,86 @@ function removeResultByKey(key){
   F=F.filter(function(r){return resultKey(r)!==key});
 }
 
+function activeFilter(selector){
+  var active=document.querySelector(selector+' .fbtn.active');
+  return active?active.dataset.f:'all';
+}
+
+function resultPassesValidFilter(r,f){
+  var lat=parseInt(r.latency||99999,10);
+  var profile=getTargetProfileInfo(currentTargetProfile);
+  if(f==='stable')return !!r.valid;
+  if(f==='unstable')return !!r.unstable;
+  if(f==='cf_bypass')return profile.has_cf_detection?!!r.cf_bypass:!!r.service_reachable;
+  if(f==='api_or_ip')return profile.has_api?r.api_reachable===true:!!r.ip;
+  if(f==='fast')return lat<1000;
+  if(f==='mid')return lat>=1000&&lat<3000;
+  if(f==='slow')return lat>=3000;
+  return !!r.valid||!!r.unstable;
+}
+
+function resultPassesInvalidFilter(r,f){
+  var err=getResultErrorText(r);
+  var cfChallenge=String(r.cf_challenge_type||'');
+  if(f==='timeout')return !!err&&err.indexOf('超时')>-1;
+  if(f==='cf_block')return cfChallenge.length>0&&!r.cf_bypass;
+  if(f==='conn')return !!err&&err.indexOf('超时')===-1&&cfChallenge.length===0;
+  if(f==='other')return !err&&cfChallenge.length===0;
+  return true;
+}
+
+function resultItemType(r){
+  if(r.valid)return 'valid';
+  if(r.unstable)return 'unstable';
+  return 'invalid';
+}
+
+function renderLimitedList(items,listKey,emptyText){
+  if(!items.length)return '<div class="empty">'+emptyText+'</div>';
+  var limit=resultRenderLimits[listKey]||RESULT_RENDER_BATCH;
+  var visible=items.slice(0,limit);
+  var html=visible.map(function(r){return itemHTML(r,resultItemType(r))}).join('');
+  if(items.length>visible.length){
+    html+='<div class="list-more"><span>已渲染 '+visible.length+' / '+items.length+' 条，复制/入库仍会处理全部结果</span><button class="btn btn-ghost" onclick="showMoreResults(\''+listKey+'\')">显示更多</button></div>';
+  }
+  return html;
+}
+
 function renderResultLists(){
-  validList.innerHTML='';
-  failList.innerHTML='';
-  V.forEach(function(r){appendItem(validList,r,'valid')});
-  U.forEach(function(r){appendItem(validList,r,'unstable')});
-  F.forEach(function(r){appendItem(failList,r,'invalid')});
-  if(!V.length&&!U.length)validList.innerHTML='<div class="empty">等待检测...</div>';
-  if(!F.length)failList.innerHTML='<div class="empty">等待检测...</div>';
-  applyActiveResultFilters();
+  var validFilter=activeFilter('#vFilters');
+  var invalidFilter=activeFilter('#fFilters');
+  var validItems=V.concat(U).filter(function(r){return resultPassesValidFilter(r,validFilter)});
+  var invalidItems=F.filter(function(r){return resultPassesInvalidFilter(r,invalidFilter)});
+  validList.innerHTML=renderLimitedList(validItems,'valid','等待检测...');
+  failList.innerHTML=renderLimitedList(invalidItems,'invalid','等待检测...');
 }
 
 function applyActiveResultFilters(){
-  var activeValid=document.querySelector('#vFilters .fbtn.active');
-  var activeInvalid=document.querySelector('#fFilters .fbtn.active');
-  if(activeValid)activeValid.click();
-  if(activeInvalid)activeInvalid.click();
+  renderResultLists();
+}
+
+function showMoreResults(listKey){
+  resultRenderLimits[listKey]=(resultRenderLimits[listKey]||RESULT_RENDER_BATCH)+RESULT_RENDER_BATCH;
+  if(listKey==='repo')renderRepo();
+  else renderResultLists();
+}
+
+function resetResultRenderLimits(scope){
+  if(scope==='repo'){
+    resultRenderLimits.repo=RESULT_RENDER_BATCH;
+    return;
+  }
+  if(scope==='valid'){
+    resultRenderLimits.valid=RESULT_RENDER_BATCH;
+    return;
+  }
+  if(scope==='invalid'){
+    resultRenderLimits.invalid=RESULT_RENDER_BATCH;
+    return;
+  }
+  resultRenderLimits.valid=RESULT_RENDER_BATCH;
+  resultRenderLimits.invalid=RESULT_RENDER_BATCH;
+  if(scope!=='results')resultRenderLimits.repo=RESULT_RENDER_BATCH;
 }
 
 function upsertResult(r){
@@ -686,9 +754,9 @@ function tagTitle(kind,value){
     service_fail:'目标首页或网页入口没通过这个代理打通；API 可能仍单独可用。',
     ip:'目标网站看到的是这个出口 IP，不一定等于你填写的代理服务器 IP。',
     country:'出口 IP 查询到的国家或地区，结果依赖第三方 IP 数据库。',
-    cf_ok:'目标网页没有被 Cloudflare 挑战页卡住，网页访问更接近真实可用。',
+    cf_ok:'目标网页这一次没有被 Cloudflare 挑战页卡住。它不保证注册、登录、Auth0 等其它入口也能通过。',
     cf_fail:'访问目标网页时撞上 Cloudflare 挑战或拦截页，浏览器里可能需要额外验证。',
-    cf_unknown:'这个模式会看 CF，但本次没有确认成功绕过 Cloudflare。',
+    cf_unknown:'这个模式会看网页 CF 状态，但本次没有确认网页入口未被 Cloudflare 拦截。',
     api_ok:'目标 API 域名能连上。401/403 也算域名可达，不代表账号、Key 或额度可用。',
     api_fail:'目标 API 域名没连通，可能是代理、DNS、TLS 或目标侧拦截导致。',
     api_unknown:'当前检测模式没有拿到 API 结果，不能据此判断 API 是否可用。',
@@ -740,9 +808,9 @@ function itemHTML(r,type){
   // CF bypass tag
   var cfTag='';
   if(hasCfDetection){
-    if(r.cf_bypass) cfTag=tagHTML('tag-cf','&#9989; CF绕过',tagTitle('cf_ok'));
-    else if(r.cf_challenge) cfTag=tagHTML('tag-cf-fail','&#10060; CF拦截('+esc(r.cf_challenge_type||'?')+')',tagTitle('cf_fail'));
-    else cfTag=tagHTML('','CF未通过',tagTitle('cf_unknown'),'background:rgba(255,255,255,.06);color:#666');
+    if(r.cf_bypass) cfTag=tagHTML('tag-cf','&#9989; 网页CF未拦截',tagTitle('cf_ok'));
+    else if(r.cf_challenge) cfTag=tagHTML('tag-cf-fail','&#10060; 网页CF拦截('+esc(r.cf_challenge_type||'?')+')',tagTitle('cf_fail'));
+    else cfTag=tagHTML('','网页CF未确认',tagTitle('cf_unknown'),'background:rgba(255,255,255,.06);color:#666');
   }
 
   // API tag
@@ -828,16 +896,18 @@ function copyValidProxies(){
 }
 function copyFailedProxies(){copyText(F.map(function(r){return r.proxy}).join("\n"));toast("已复制 "+F.length+" 个失效代理")}
 function clearValid(){
-  V=[];U=[];validList.innerHTML='<div class="empty">等待检测...</div>';
+  V=[];U=[];resetResultRenderLimits('valid');renderResultLists();
   updateStats();saveResults();toast('已清空有效代理');
 }
 function clearFailed(){
-  F=[];failList.innerHTML='<div class="empty">等待检测...</div>';
+  F=[];resetResultRenderLimits('invalid');renderResultLists();
   updateStats();saveResults();toast('已清空失效代理');
 }
 function clearAll(){
   if(busy)stopCheck();
   proxyInput.value="";V=[];U=[];F=[];totalCount=0;sid=null;
+  clearTimeout(resultsSaveTimer);resultsSaveTimer=null;
+  resetResultRenderLimits();
   try{localStorage.removeItem(RESULTS_KEY)}catch(e){}
   validList.innerHTML='<div class="empty">等待检测...</div>';
   failList.innerHTML='<div class="empty">等待检测...</div>';
@@ -889,62 +959,23 @@ document.querySelectorAll('.fbtn').forEach(function(btn){
     btn.classList.add('active');
     var f=btn.dataset.f;
     if(bar.id==='repoFilters'){
+      resetResultRenderLimits('repo');
       filterRepoList(f);
       return;
     }
-    var listId=bar.id==='vFilters'?'validList':'failList';
-    document.querySelectorAll('#'+listId+' .proxy-item').forEach(function(item){
-      var lat=parseInt(item.dataset.lat);
-      var err=item.dataset.err;
-      var stb=item.dataset.stable;
-      var cf=item.dataset.cf;
-      var service=item.dataset.service;
-      var api=item.dataset.api;
-      var ip=item.dataset.ip;
-      var cfChal=item.dataset.cfChallenge;
-      var show=true;
-      if(listId==='validList'){
-        if(f==='stable')show=stb==='y';
-        else if(f==='unstable')show=stb==='u';
-        else if(f==='cf_bypass')show=getTargetProfileInfo(currentTargetProfile).has_cf_detection?cf==='y':service==='y';
-        else if(f==='api_or_ip')show=getTargetProfileInfo(currentTargetProfile).has_api?api==='y':ip==='y';
-        else if(f==='fast')show=lat<1000;
-        else if(f==='mid')show=lat>=1000&&lat<3000;
-        else if(f==='slow')show=lat>=3000;
-        else show=stb==='y'||stb==='u';
-      }else{
-        if(f==='timeout')show=err==='y'&&item.textContent.indexOf('\u8d85\u65f6')>-1;
-        else if(f==='cf_block')show=cfChal.length>0&&cf!=='y';
-        else if(f==='conn')show=err==='y'&&item.textContent.indexOf('\u8d85\u65f6')===-1&&cfChal.length===0;
-        else if(f==='other')show=err==='n'&&cfChal.length===0;
-        else show=true;
-      }
-      item.style.display=show?'flex':'none';
-    });
+    if(bar.id==='vFilters')resetResultRenderLimits('valid');
+    else if(bar.id==='fFilters')resetResultRenderLimits('invalid');
+    renderResultLists();
   });
 });
 document.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();if(busy)stopCheck();else startCheck()}});
 
 function filterRepoList(f){
-  document.querySelectorAll('#repoList .proxy-item').forEach(function(item){
-    var show=true;
-    if(f==='grade_a')show=item.dataset.grade==='A';
-    else if(f==='grade_b')show=item.dataset.grade==='B';
-    else if(f==='grade_c')show=item.dataset.grade==='C';
-    else if(f==='grade_d')show=item.dataset.grade==='D';
-    else if(f==='service')show=item.dataset.service==='y';
-    else if(f==='api')show=item.dataset.api==='y';
-    else if(f==='cf')show=item.dataset.cf==='y';
-    else if(f==='dc')show=item.dataset.ipType==='datacenter';
-    else if(f==='res')show=item.dataset.ipType==='residential';
-    else if(f==='country')show=item.dataset.country==='y';
-    item.style.display=show?'flex':'none';
-  });
+  renderRepo();
 }
 
 function applyRepoFilter(){
-  var active=document.querySelector('#repoFilters .fbtn.active');
-  filterRepoList(active?active.dataset.f:'all');
+  renderRepo();
 }
 
 // ============================================================
@@ -1680,8 +1711,14 @@ function clearCheckedHistory(){
   else{label.textContent='跳过已检测'}
 })();
 
-function saveResults(){
+function saveResultsNow(){
+  clearTimeout(resultsSaveTimer);
+  resultsSaveTimer=null;
   try{localStorage.setItem(RESULTS_KEY,JSON.stringify({valid:V,unstable:U,invalid:F}))}catch(e){}
+}
+function saveResults(){
+  clearTimeout(resultsSaveTimer);
+  resultsSaveTimer=setTimeout(saveResultsNow,500);
 }
 function loadSavedResults(){
   try{var d=JSON.parse(localStorage.getItem(RESULTS_KEY));if(d){V=d.valid||[];U=d.unstable||[];F=d.invalid||[];return true}}catch(e){}
@@ -1811,6 +1848,22 @@ function addSingleResultToRepo(button){
   else toast('仓库已更新，稍后自动同步云端');
 }
 
+function repoPassesFilter(p,f){
+  var g=p.grade||'F';
+  var country=p.country?String(p.country).toUpperCase():'';
+  if(f==='grade_a')return g==='A';
+  if(f==='grade_b')return g==='B';
+  if(f==='grade_c')return g==='C';
+  if(f==='grade_d')return g==='D';
+  if(f==='service')return p.service_reachable===true;
+  if(f==='api')return p.api_reachable===true;
+  if(f==='cf')return !!p.cf_bypass;
+  if(f==='dc')return p.ip_type==='datacenter';
+  if(f==='res')return p.ip_type==='residential';
+  if(f==='country')return !!country;
+  return true;
+}
+
 function renderRepo(){
   var repo=loadRepo();
   var list=document.getElementById('repoList');
@@ -1823,8 +1876,14 @@ function renderRepo(){
   var html='';
   var displayRepo=repo.map(function(p,i){return {item:p,index:i}}).sort(function(a,b){
     return (b.item.updated||b.item.added||0)-(a.item.updated||a.item.added||0);
-  });
-  displayRepo.forEach(function(entry){
+  }).filter(function(entry){return repoPassesFilter(entry.item,activeFilter('#repoFilters'))});
+  if(!displayRepo.length){
+    list.innerHTML='<div class="empty">当前筛选没有匹配的仓库代理</div>';
+    return;
+  }
+  var limit=resultRenderLimits.repo||RESULT_RENDER_BATCH;
+  var visibleRepo=displayRepo.slice(0,limit);
+  visibleRepo.forEach(function(entry){
     var p=entry.item;
     var i=entry.index;
     var gradeColors={'A':'#22c55e','B':'#10b981','C':'#eab308','D':'#f97316','F':'#ef4444'};
@@ -1844,7 +1903,7 @@ function renderRepo(){
       (p.api_reachable===true?tagHTML('tag-ok','API域名可达',tagTitle('api_ok')):'')+
       (country?tagHTML('tag-country','国家: '+esc(country),tagTitle('country')):'')+
       (p.ip_type==='datacenter'?tagHTML('tag-dc','机房',getIpTypeTitle(p.ip_type)):p.ip_type==='residential'?tagHTML('tag-res','住宅',getIpTypeTitle(p.ip_type)):'')+
-      (p.cf_bypass?tagHTML('tag-cf','CF绕过',tagTitle('cf_ok')):'')+
+      (p.cf_bypass?tagHTML('tag-cf','网页CF未拦截',tagTitle('cf_ok')):'')+
       '</div></div>'+
       '<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'+
       (p.latency?tagHTML('tag-lat','<span class="speed-dot '+spd+'"></span>'+esc(lat),tagTitle('latency')):'')+
@@ -1853,10 +1912,12 @@ function renderRepo(){
       '<button class="copy-btn" style="opacity:0.6;color:#ef4444" onclick="event.stopPropagation();removeFromRepo('+i+')">删除</button>'+
       '</div></div>';
   });
+  if(displayRepo.length>visibleRepo.length){
+    html+='<div class="list-more"><span>已渲染 '+visibleRepo.length+' / '+displayRepo.length+' 条，复制/导出仍会处理全部仓库</span><button class="btn btn-ghost" onclick="showMoreResults(\'repo\')">显示更多</button></div>';
+  }
   list.innerHTML=html;
   list.style.maxHeight='420px';
   list.style.overflowY='auto';
-  applyRepoFilter();
 }
 
 function removeFromRepo(idx){
@@ -1989,9 +2050,8 @@ if(!repoClearedManually && !loadRepo().length){
 if(loadSavedResults()){
   var all=V.concat(U).concat(F);
   if(all.length>0){
-    V.forEach(function(r){appendItem(validList,r,"valid")});
-    U.forEach(function(r){appendItem(validList,r,"unstable")});
-    F.forEach(function(r){appendItem(failList,r,"invalid")});
+    resetResultRenderLimits('results');
+    renderResultLists();
     updateStats();
     statusText.textContent="已恢复 "+all.length+" 条历史结果";
   }
