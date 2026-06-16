@@ -1,0 +1,30 @@
+services:
+  proxy-checker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: proxy-checker
+    ports:
+      - "8888:8888"
+    restart: unless-stopped
+    environment:
+      PORT: 8888
+      TZ: Asia/Hong_Kong
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 1.5G
+    networks:
+      - proxy-checker
+      - apinetwork
+
+networks:
+  proxy-checker:
+    name: proxy-checker
+  apinetwork:
+    name: apinetwork
